@@ -387,6 +387,15 @@ def run_trial(client: Ollama, model: str, style: str, probe: Probe, pivot: str,
             print(f"      pivot: {pivot_text[:110]}")
             print(f"      back : {back_text[:110]}")
         current = back_text  # feed forward: iterate toward the fixed point
+        # At temperature 0 the round trip is a deterministic map and typically
+        # reaches a fixed point after one or two passes: f(f(x)) == f(x). Further
+        # iterations only reproduce the same string. Stop rather than pay for it.
+        if k > 1 and normalise(hop.back_text) == normalise(trial.hops[-2].back_text):
+            if verbose and k < iterations:
+                print(f"      -> fixed point at #{k}; skipping "
+                      f"{iterations - k} further iteration(s). "
+                      f"Add pivots, not iterations, for diversity.")
+            break
     return trial
 
 
@@ -483,22 +492,72 @@ def rank_variants(pool: list[Variant], source: str, *, n: int,
     return kept[:n], rejected
 
 
+FIDELITY_SPREAD_MIN = 5.0  # points; below this the axis carries no ordering info
+
+
+def fidelity_degenerate(pool: list[Variant],
+                        threshold: float = FIDELITY_SPREAD_MIN) -> tuple[bool, float]:
+    """Detect a collapsed fidelity axis.
+
+    Ranking here is 'sort by diversity, among candidates that passed the fidelity
+    gate'. That is only meaningful if fidelity actually discriminates. The
+    content-recall proxy saturates on short inputs — every candidate retains the
+    same 7 of 8 content words and scores identically — at which point the sort
+    degenerates to pure diversity, and the most-reworded candidate wins whether
+    or not it still means the same thing. Observed in practice: a candidate that
+    moved 'yesterday' from the calling to the finding scored top precisely
+    because it had drifted furthest.
+
+    Returns (is_degenerate, spread). COMET scores are not subject to this check:
+    a genuine small spread there means the candidates really are equivalent."""
+    if len(pool) < 2:
+        return False, 0.0                     # nothing is being ranked
+    if all(v.fidelity_source == "comet" for v in pool):
+        return False, max(v.fidelity for v in pool) - min(v.fidelity for v in pool)
+    spread = max(v.fidelity for v in pool) - min(v.fidelity for v in pool)
+    return spread < threshold, spread
+
+
 def report_variants(pools: dict[str, list[Variant]], *, n: int,
-                    fidelity_floor: float, allow_flagged: bool) -> dict:
-    out: dict[str, list[dict]] = {}
+                    fidelity_floor: float, allow_flagged: bool,
+                    force_rank: bool = False,
+                    spread_min: float = FIDELITY_SPREAD_MIN) -> dict:
+    out: dict[str, dict] = {}
     for source, pool in pools.items():
         kept, rejected = rank_variants(pool, source, n=n,
                                        fidelity_floor=fidelity_floor,
                                        allow_flagged=allow_flagged)
+        degenerate, spread = fidelity_degenerate(
+            [v for v in pool if v.fidelity >= fidelity_floor], spread_min)
+        ranked = force_rank or not degenerate
+        if not ranked:
+            # Neutral order — grouping by pivot makes no quality claim, whereas
+            # any score-based order would imply one the metrics cannot support.
+            kept.sort(key=lambda v: (v.pivot, v.iteration))
+
         print("\n" + "=" * 78)
         print(f"SOURCE  {source}")
         print("=" * 78)
         if not kept:
             print("  no candidate cleared the filters — lower --fidelity-floor,")
-            print("  raise --iterations, or add a more distant pivot")
+            print("  add more pivots, or use --allow-flagged to inspect rejects")
+        elif ranked:
+            print(f"  ranked by diversity (fidelity spread {spread:.1f} pts)")
+        else:
+            print(f"  \u26a0 NOT RANKED — fidelity spread is {spread:.1f} pts "
+                  f"(< {spread_min:.0f}), so the")
+            print("    fidelity axis carries no ordering information and the sort")
+            print("    would reduce to 'most reworded wins'. That promotes drift.")
+            print("    Candidates below are in neutral order, NOT best-first.")
+            print("    Fix: --comet for a real fidelity metric, or --force-rank")
+            print("    to override, or judge these by eye.")
+
+        label = "" if ranked else " "
         for i, v in enumerate(kept, 1):
-            print(f"  {i}. [{v.pivot} #{v.iteration}] div={v.diversity:5.1f} "
-                  f"fid={v.fidelity:5.1f}")
+            warn = f"  \u26a0 {'; '.join(v.flags)}" if v.flags else ""
+            num = f"{i}." if ranked else f"{label}-"
+            print(f"  {num} [{v.pivot} #{v.iteration}] div={v.diversity:5.1f} "
+                  f"fid={v.fidelity:5.1f}{warn}")
             print(f"     {v.text}")
         if rejected:
             print(f"\n  rejected ({len(rejected)}):")
@@ -507,7 +566,13 @@ def report_variants(pools: dict[str, list[Variant]], *, n: int,
                 print(f"      {v.text[:100]}")
             if len(rejected) > 6:
                 print(f"    ... and {len(rejected) - 6} more")
-        out[source] = [asdict(v) for v in kept]
+        out[source] = {
+            "ranking": "diversity" if ranked else "unranked-degenerate-fidelity",
+            "fidelity_spread": round(spread, 2),
+            "fidelity_source": pool[0].fidelity_source if pool else None,
+            "kept": [asdict(v) for v in kept],
+            "rejected": [asdict(v) for v in rejected],
+        }
     print("\nFidelity is a proxy unless --comet is active. Read the variants "
           "before shipping them.")
     return out
@@ -592,6 +657,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--allow-flagged", action="store_true",
                     help="keep variants flagged for added specification or "
                          "expansion/compression instead of rejecting them")
+    ap.add_argument("--force-rank", action="store_true",
+                    help="rank by diversity even when the fidelity axis has "
+                         "collapsed (not advised — promotes drift)")
+    ap.add_argument("--fidelity-spread-min", type=float, default=FIDELITY_SPREAD_MIN,
+                    help=f"fidelity spread below which ranking is withheld "
+                         f"(default {FIDELITY_SPREAD_MIN:g})")
     ap.add_argument("--comet", action="store_true", help="use COMET if installed")
     ap.add_argument("--text", action="append", default=None,
                     help="custom sentence (repeatable); replaces the probe set")
@@ -649,7 +720,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.variants:
         payload["variants"] = report_variants(
             collect_variants(trials, comet), n=args.variants,
-            fidelity_floor=args.fidelity_floor, allow_flagged=args.allow_flagged)
+            fidelity_floor=args.fidelity_floor, allow_flagged=args.allow_flagged,
+            force_rank=args.force_rank, spread_min=args.fidelity_spread_min)
     else:
         report(trials, args.control)
         payload["trials"] = [asdict(t) for t in trials]
